@@ -30,7 +30,9 @@
  * 6-July-2006
  * DRI: Christopher Ryan <ryanc@apple.com>
 */
- 
+
+#define _FILE_OFFSET_BITS 64
+
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -78,10 +80,25 @@ xar_signature_t xar_signature_new(xar_t x,const char *type, int32_t length, xar_
 	XAR(x)->heap_len += length;
 
 	// Put the new on at the end of the list
-	if( XAR_SIGNATURE(XAR(x)->signatures) )
-		XAR_SIGNATURE(XAR(x)->signatures)->next = XAR_SIGNATURE(ret);
-	else
+	if( XAR_SIGNATURE(XAR(x)->signatures) ) {
+		struct __xar_signature_t *sig;
+		
+		// (Apple) Find the end of the signatures list
+		// The open source code seems to smash list items 1 through n when the head of this list is already defined
+		// despite the fact that the xar signatures are implemented as a list.  This is an Apple xar 1.4 edit
+		// to allow that list to grow beyond 2
+		for( sig = XAR_SIGNATURE(XAR(x)->signatures); sig->next; sig = sig->next);
+		
+		sig->next = XAR_SIGNATURE(ret);
+	} else {
+		char tmpstr[32];
+ 		time_t t = time(NULL) - 978307200 /* Convert from Unix EPOCH to 3rd Millenium EPOCH */;
+		/* (3rd Millenium EPOCH is seconds since Jan 1 2001 0000 UTC) */
+		memset(tmpstr, 0, sizeof(tmpstr));
+		snprintf(tmpstr, sizeof(tmpstr)-1, "%ld", (long) t);
+ 		xar_prop_set(XAR_FILE(x), "signature-creation-time", tmpstr);
 		XAR(x)->signatures = ret;
+	}
 
 	XAR_SIGNATURE(ret)->x = x;
 	
@@ -112,7 +129,12 @@ int32_t xar_signature_add_x509certificate(xar_signature_t sig, const uint8_t *ce
 	newcert->len = cert_len;
 	
 	if( XAR_SIGNATURE(sig)->x509certs ){
-		XAR_SIGNATURE(sig)->x509certs->next = newcert;
+		struct __xar_x509cert_t *cert;
+		
+		// Find the end of the linked list
+		for( cert = XAR_SIGNATURE(sig)->x509certs; cert->next; cert = cert->next );
+		
+		cert->next = newcert;
 	}else{
 		XAR_SIGNATURE(sig)->x509certs = newcert;		
 	}
@@ -204,45 +226,64 @@ int32_t _xar_signature_read_from_heap(xar_t x ,off_t offset,size_t length,uint8_
 }
 
 /* This method retrieves the signed data for this segment as well as the data the signed data is signing */
-uint8_t xar_signature_copy_signed_data(xar_signature_t sig, uint8_t **data, uint32_t *length, uint8_t **signed_data, uint32_t *signed_length)
+int32_t xar_signature_copy_signed_data(xar_signature_t sig, uint8_t **data, uint32_t *length, uint8_t **signed_data, uint32_t *signed_length, uint64_t *signed_offset)
 {
-	uint32_t offset = 0;
+	uint64_t offset = 0;
 	xar_t x = NULL;
 	const char	*value;
+	
+	// xar 1.6 fails this method if any of data, length, signed_data, signed_length are NULL
+	// within OS X we use this method to get combinations of signature, signed data, or signed_offset,
+	// so this method checks and sets these out values independently
 	
 	if( !sig )
 		return -1;
 	
-	if( !data || !length )
+	if( data && !length )
 		return -1;
-	
-	if( !signed_data || !signed_length )
+
+	if( signed_data && !signed_length )
 		return -1;
-	
+
 	x = XAR_SIGNATURE(sig)->x;
 	
 	
 	/* Get the checksum, to be used for signing.  If we support multiple checksums
 		in the future, all checksums should be retrieved						*/
-	if(0 == xar_prop_get( XAR_FILE(x) , "checksum/size", &value)){
-		*length  = strtoull( value, (char **)NULL, 10);
-	}
+	if(length) {
+		if(0 == xar_prop_get( XAR_FILE(x) , "checksum/size", &value)){
+			*length  = strtoull( value, (char **)NULL, 10);
+		}
 
-	if(0 == xar_prop_get( XAR_FILE(x) , "checksum/offset", &value)){
-		offset  = strtoull( value, (char **)NULL, 10);
-	}
+		if(0 == xar_prop_get( XAR_FILE(x) , "checksum/offset", &value)){
+			offset  = strtoull( value, (char **)NULL, 10);
+		}
 	
-	*data = malloc(sizeof(char)*(*length));
+		if(data) {
+			*data = malloc(sizeof(char)*(*length));
 
-	_xar_signature_read_from_heap(x, offset, *length, *data);
+			_xar_signature_read_from_heap(x, offset, *length, *data);
+		}
+	}
 	
 	/* read signature data */
-	*signed_length  = XAR_SIGNATURE(sig)->len;
 	offset  = XAR_SIGNATURE(sig)->offset;
 	
-	*signed_data = malloc(sizeof(char)*(*signed_length));
+	// This parameter is an Apple edit
+	// This out value is ignored OS X in SL, but this method prototype is included in the 10.5 SDK
+	if( signed_offset )
+		*signed_offset = offset;
 	
-	_xar_signature_read_from_heap(x, offset, *signed_length, *signed_data);
+	if(signed_length) {
+		
+		*signed_length  = XAR_SIGNATURE(sig)->len;
+		
+		if(signed_data) {
+			*signed_data = malloc(sizeof(char)*(*signed_length));
+	
+			_xar_signature_read_from_heap(x, offset, *signed_length, *signed_data);
+		}
+	}
 				
 	return 0;
 }
@@ -253,6 +294,7 @@ xar_signature_t xar_signature_unserialize(xar_t x, xmlTextReaderPtr reader)
 	const xmlChar *value = NULL;
 	const xmlChar *name = NULL;
 	int type;
+	unsigned int outputLength;
 	
 	ret = malloc(sizeof(struct __xar_signature_t));
 	
@@ -276,6 +318,11 @@ xar_signature_t xar_signature_unserialize(xar_t x, xmlTextReaderPtr reader)
 	while( xmlTextReaderRead(reader) == 1 ) {
 		type = xmlTextReaderNodeType(reader);
 		name = xmlTextReaderConstLocalName(reader);
+	
+		if (value) {
+			xmlFree((void*)value);
+			value = NULL;
+		}
 		
 		if( type == XML_READER_TYPE_ELEMENT ) {
 			if(strcmp((const char*)name, "size") == 0) {
@@ -284,6 +331,7 @@ xar_signature_t xar_signature_unserialize(xar_t x, xmlTextReaderPtr reader)
 					if( type == XML_READER_TYPE_TEXT ) {
 						value = xmlTextReaderConstValue(reader);				
 						ret->len = strtoull( (const char *)value, (char **)NULL, 10);
+						value = NULL; /* We don't want to accidentally release this const. */	
 					}else if( type == XML_READER_TYPE_END_ELEMENT ) {
 						break;
 					}
@@ -294,6 +342,7 @@ xar_signature_t xar_signature_unserialize(xar_t x, xmlTextReaderPtr reader)
 					if( type == XML_READER_TYPE_TEXT ) {
 						value = xmlTextReaderConstValue(reader);				
 						ret->offset = strtoull( (const char *)value, (char **)NULL, 10);
+						value = NULL; /* We don't want to accidentally release this const. */
 					}else if( type == XML_READER_TYPE_END_ELEMENT ) {
 						break;
 					}
@@ -318,13 +367,15 @@ xar_signature_t xar_signature_unserialize(xar_t x, xmlTextReaderPtr reader)
 												
 												value = xmlTextReaderConstValue(reader);
 												
-												/* this method allocages the resulting data */
-												sig_data = xar_from_base64(value, strlen((const char *)value));
+												/* this method allocates the resulting data */
+												sig_data = xar_from_base64(value, strlen((const char *)value), &outputLength);
 												
 												/* for convience we just use the same method, which means multiple allocations */
-												xar_signature_add_x509certificate(ret,sig_data,(3 * (strlen((const char *)value) / 4 + 1)));
+												xar_signature_add_x509certificate(ret, sig_data, outputLength);
 												free(sig_data);
-												break;
+												
+												value = NULL; /* We don't want to accidentally release this const. */
+												//break;
 											}else if( type == XML_READER_TYPE_END_ELEMENT ) {
 												break;
 											}
@@ -343,10 +394,16 @@ xar_signature_t xar_signature_unserialize(xar_t x, xmlTextReaderPtr reader)
 			}			
 		}else if( type == XML_READER_TYPE_TEXT ) {
 			value = xmlTextReaderConstValue(reader);
+			value = NULL; /* We don't want to accidentally release this const. */
 			break;
 		}else if( type == XML_READER_TYPE_END_ELEMENT ) {
 			break;
 		}
+	}
+	
+	if (value) {
+		xmlFree((void*)value);
+		value = NULL;
 	}
 	
 	return ret;
@@ -388,7 +445,7 @@ int32_t xar_signature_serialize(xar_signature_t sig, xmlTextWriterPtr writer)
 	xmlTextWriterStartElementNS( writer, NULL, BAD_CAST("KeyInfo"), NULL);
 	xmlTextWriterWriteAttribute(writer, BAD_CAST("xmlns"), BAD_CAST("http://www.w3.org/2000/09/xmldsig#"));
 	
-	/* If we have x509 certs, right them out */
+	/* If we have x509 certs, write them out */
 	if( XAR_SIGNATURE(sig)->x509certs ){
 		struct __xar_x509cert_t *cert;
 		
